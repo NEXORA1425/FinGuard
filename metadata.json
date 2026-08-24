@@ -1,0 +1,6 @@
+{
+  "name": "FinGuard",
+  "description": "A Financial Safety Layer that helps users pause, understand potential risks, and make informed decisions before making a payment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

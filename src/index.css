@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+@layer base {
+  @media print {
+    /* Hide navigation, footers, interactive action buttons when printing */
+    header,
+    footer,
+    #nav-brand-logo,
+    #nav-mobile-menu,
+    .no-print,
+    button:not(.print-include) {
+      display: none !important;
+    }
+
+    body {
+      background: #ffffff !important;
+      color: #0f172a !important;
+      font-size: 12pt !important;
+    }
+
+    /* Print header title */
+    .print-header {
+      display: block !important;
+    }
+
+    /* Prevent awkward page breaks */
+    .page-break-inside-avoid,
+    #risk-score-container,
+    #risk-factor-container,
+    .risk-card {
+      break-inside: avoid !important;
+      page-break-inside: avoid !important;
+    }
+
+    /* Border and shadow normalization for crisp paper output */
+    * {
+      box-shadow: none !important;
+      text-shadow: none !important;
+    }
+  }
+}
