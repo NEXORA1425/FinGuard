@@ -3,14 +3,14 @@ import { User, UserRole } from '../types';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { auth, db } from '../firebase';
 import { doc, getDoc } from 'firebase/firestore';
-import { loginWithFirebase, signupWithFirebase, logoutFromFirebase } from '../services/authService';
-import { getMeApi } from '../services/authService';
+import { loginWithFirebase, loginWithGoogle as googleLoginService, signupWithFirebase, logoutFromFirebase, getMeApi } from '../services/authService';
 
 interface AuthContextType {
   user: User | null;
   loading: boolean;
   error: string | null;
   login: (email: string, password: string) => Promise<boolean>;
+  loginWithGoogle: () => Promise<boolean>;
   signup: (email: string, password: string, name: string, role?: UserRole) => Promise<boolean>;
   logout: () => Promise<void>;
   clearError: () => void;
@@ -77,6 +77,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+  const loginWithGoogle = async (): Promise<boolean> => {
+    setError(null);
+    setLoading(true);
+    try {
+      const u = await googleLoginService();
+      setUser(u);
+      return true;
+    } catch (err: any) {
+      setError(err.message || 'Google Sign-In failed.');
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const signup = async (
     email: string,
     password: string,
@@ -116,6 +131,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         loading,
         error,
         login,
+        loginWithGoogle,
         signup,
         logout,
         clearError,

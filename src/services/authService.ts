@@ -1,13 +1,53 @@
 import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
+  signInWithPopup,
   signOut as firebaseSignOut,
   updateProfile,
   User as FirebaseUser,
 } from 'firebase/auth';
-import { auth, db } from '../firebase';
+import { auth, db, googleProvider } from '../firebase';
 import { doc, setDoc, getDoc } from 'firebase/firestore';
 import { User, UserRole } from '../types';
+
+export async function loginWithGoogle(): Promise<User> {
+  try {
+    const userCredential = await signInWithPopup(auth, googleProvider);
+    const fbUser = userCredential.user;
+    const cleanEmail = (fbUser.email || '').toLowerCase();
+    let role: UserRole = cleanEmail.includes('admin') ? 'admin' : 'user';
+
+    try {
+      const docRef = doc(db, 'users', fbUser.uid);
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists() && docSnap.data().role) {
+        role = docSnap.data().role;
+      } else {
+        await setDoc(docRef, {
+          uid: fbUser.uid,
+          email: cleanEmail,
+          name: fbUser.displayName || 'Google User',
+          role,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    } catch (e) {
+      console.warn('Firestore Google signin doc update notice:', e);
+    }
+
+    return {
+      id: fbUser.uid,
+      email: cleanEmail,
+      name: fbUser.displayName || fbUser.email?.split('@')[0] || 'Google User',
+      role,
+      createdAt: fbUser.metadata.creationTime || new Date().toISOString(),
+    };
+  } catch (err: any) {
+    console.error('Google Sign-In Error:', err);
+    throw new Error(err.message || 'Google Sign-In failed.');
+  }
+}
+
 
 export async function loginWithFirebase(email: string, password: string): Promise<User> {
   const cleanEmail = email.trim().toLowerCase();
