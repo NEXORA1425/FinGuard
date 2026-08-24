@@ -1,16 +1,15 @@
 import { StoredDocument, ExtractedDocumentData } from '../types';
 import { getStoredToken } from './authService';
-import { BUCKET_NAME } from '../supabase';
 
 export async function uploadDocumentApi(
-  file: File,
+  fileInfo: { name: string; size: number; type: string },
   extractedData?: ExtractedDocumentData,
   storagePath?: string,
   storageBucket?: string
 ): Promise<StoredDocument> {
   const token = getStoredToken();
   if (!token) {
-    throw new Error('You must be logged in to store documents.');
+    throw new Error('You must be logged in to store documents in your vault.');
   }
 
   const response = await fetch('/api/documents/upload', {
@@ -20,18 +19,18 @@ export async function uploadDocumentApi(
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({
-      fileName: file.name,
-      fileSize: file.size,
-      mimeType: file.type || 'application/octet-stream',
-      storageBucket: storageBucket || BUCKET_NAME,
-      storagePath: storagePath || `documents/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`,
+      fileName: fileInfo.name,
+      fileSize: fileInfo.size,
+      mimeType: fileInfo.type || 'application/octet-stream',
+      storagePath,
+      storageBucket,
       extractedData,
     }),
   });
 
   const data = await response.json();
   if (!response.ok || !data.success) {
-    throw new Error(data.error || 'Document registration failed.');
+    throw new Error(data.error || 'Document storage in vault failed.');
   }
 
   return data.document as StoredDocument;

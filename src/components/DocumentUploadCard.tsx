@@ -85,8 +85,8 @@ export const DocumentUploadCard: React.FC<DocumentUploadCardProps> = ({
     setCurrentStage('Validating file...');
 
     try {
-      // Step 1: AI Metadata Extraction via Gemini + Fast pdf-parse
-      const result = await parsePaymentDocument(file, (stage) => {
+      // Step 1: AI Metadata Extraction via Gemini + Supabase Storage
+      const result = await parsePaymentDocument(file, user?.id, (stage) => {
         setCurrentStage(stage);
       });
 
@@ -99,10 +99,19 @@ export const DocumentUploadCard: React.FC<DocumentUploadCardProps> = ({
         return;
       }
 
-      // Step 2: Store in user vault if logged in
+      // Step 2: Store document reference in user vault if logged in
       if (user) {
         try {
-          await uploadDocumentApi(file, result.data);
+          await uploadDocumentApi(
+            {
+              name: file.name,
+              size: file.size,
+              type: file.type || fileExtension.replace('.', '').toUpperCase(),
+            },
+            result.data,
+            result.storagePath,
+            result.storageBucket
+          );
           setIsVaultSaved(true);
         } catch (vaultErr) {
           console.warn('Vault saving warning:', vaultErr);

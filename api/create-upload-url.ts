@@ -1,12 +1,11 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getSupabaseAdmin, BUCKET_NAME } from '../src/supabase';
+import { supabaseAdmin, BUCKET_NAME } from '../src/supabase';
 
 export const config = {
   maxDuration: 15,
 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Set CORS headers
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -28,7 +27,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { fileName, mimeType, fileSize } = req.body || {};
+    const { fileName, mimeType, fileSize, userId } = req.body || {};
 
     if (!fileName || !mimeType) {
       return res.status(400).json({
@@ -60,25 +59,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // Generate secure random UUID path (no client path override allowed)
-    const fileId = `${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+    // Generate canonical single path
+    const fileId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
     const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const storagePath = `anonymous/${fileId}-${sanitizedName}`;
+    const userFolder = userId ? String(userId).replace(/[^a-zA-Z0-9._-]/g, '_') : 'anonymous';
+    const storagePath = `${userFolder}/${fileId}-${sanitizedName}`;
 
-    // Get Server-Side Admin Client (Service Role Key required)
-    const supabaseAdmin = getSupabaseAdmin();
+    // Ensure bucket existence
+    try {
+      await supabaseAdmin.storage.createBucket(BUCKET_NAME, {
+        public: false,
+        fileSizeLimit: 20971520,
+        allowedMimeTypes: validMimes,
+      });
+    } catch (_) {}
 
-    // Create signed upload URL from private Supabase Storage bucket
+    // Create signed upload URL
     const { data, error } = await supabaseAdmin.storage
       .from(BUCKET_NAME)
       .createSignedUploadUrl(storagePath);
 
-    if (error || !data || !data.token || !data.signedUrl) {
-      console.error('[CREATE_UPLOAD_URL_FAILED]', error ? error.message : 'No signed token returned');
+    if (error || !data) {
+      console.warn('[CREATE_UPLOAD_URL_WARN] Signed upload URL failed:', error?.message);
       return res.status(500).json({
         success: false,
-        error: 'UPLOAD_AUTHORIZATION_FAILED',
-        message: 'Unable to prepare secure file upload. Storage bucket authorization failed.',
+        error: 'UPLOAD_FAILED',
+        message: error?.message || 'Unable to create upload authorization in Supabase Storage.',
       });
     }
 
@@ -90,11 +96,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       token: data.token,
     });
   } catch (error: any) {
-    console.error('[CREATE_UPLOAD_URL_EXCEPTION]', error);
+    console.error('[CREATE_UPLOAD_URL_ERROR]', error);
     return res.status(500).json({
       success: false,
-      error: 'UPLOAD_AUTHORIZATION_FAILED',
-      message: error.message || 'Unable to prepare secure file upload.',
+      error: 'SERVER_CONFIG_ERROR',
+      message: error.message || 'Server-side upload authorization error.',
     });
   }
 }

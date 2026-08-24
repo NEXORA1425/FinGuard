@@ -385,8 +385,13 @@ Key extraction targets:
       };
     }
 
-    // Parse JSON
-    const parsed = JSON.parse(responseText);
+    // Clean markdown code fences if present in Gemini output
+    let cleanJsonText = responseText;
+    if (cleanJsonText.includes('```')) {
+      cleanJsonText = cleanJsonText.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+    }
+
+    const parsed = JSON.parse(cleanJsonText);
     const totalTime = Date.now() - startTime;
     safeLog('EXTRACTION_SUCCESS', `Extraction completed cleanly in ${totalTime}ms.`);
 
