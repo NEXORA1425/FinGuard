@@ -3,6 +3,11 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
+import * as pdfParseModule from "pdf-parse";
+
+const pdfParse = (pdfParseModule as any).default || pdfParseModule;
+
+
 
 // In-Memory Database & Persistence Types
 interface UserRecord {
@@ -227,17 +232,24 @@ export async function createExpressApp() {
   // DOCUMENT EXTRACTION & UPLOAD ROUTES
   // ==========================================
 
-  // Document extraction API using Gemini
+  // Document extraction API using Gemini & pdf-parse
   app.post("/api/extract-document", async (req, res) => {
+    const startTime = Date.now();
     try {
-      const { fileBase64, mimeType, fileName } = req.body;
+      const { fileBase64, mimeType, fileName } = req.body || {};
       if (!fileBase64 || !mimeType) {
         return res.status(400).json({ error: "Missing file data or mime type." });
       }
 
+      const cleanBase64 = fileBase64.replace(/^data:[^;]+;base64,/, '');
+      const estimatedSizeBytes = Math.round((cleanBase64.length * 3) / 4);
+
+      if (estimatedSizeBytes > 20 * 1024 * 1024) {
+        return res.status(400).json({ error: "File size exceeds the 20MB maximum limit." });
+      }
+
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
-        // Fallback demo parser if API key is not provided in env
         return res.json({
           success: true,
           data: {
@@ -249,9 +261,26 @@ export async function createExpressApp() {
             urgentLanguageDetected: "",
             isUnusualMethod: false,
             unusualMethodDetected: "",
-            explanation: "Parsed standard services invoice sample.",
+            explanation: "Parsed standard services invoice sample (Local fallback).",
           },
         });
+      }
+
+      let extractedText = '';
+      let isPdfTextParsed = false;
+
+      // Fast PDF Text Extraction via pdf-parse
+      if (mimeType.toLowerCase().includes('pdf') || (fileName && fileName.toLowerCase().endsWith('.pdf'))) {
+        try {
+          const fileBuffer = Buffer.from(cleanBase64, 'base64');
+          const pdfData = await pdfParse(fileBuffer);
+          extractedText = (pdfData.text || '').trim();
+          if (extractedText.length > 20) {
+            isPdfTextParsed = true;
+          }
+        } catch (e) {
+          console.warn('[SERVER] pdf-parse fallback warning:', e);
+        }
       }
 
       const ai = new GoogleGenAI({
@@ -263,9 +292,7 @@ export async function createExpressApp() {
         },
       });
 
-      const cleanBase64 = fileBase64.replace(/^data:[^;]+;base64,/, '');
-
-      const prompt = `You are a financial document analyzer for FinGuard, a decision-safety assistant.
+      const systemInstructions = `You are a financial document analyzer for FinGuard, a decision-safety assistant.
 Extract key payment details from this document (invoice, bill, quotation, payment request, or screenshot).
 Do not accuse the document or claim it is fraudulent. Objectively extract what is visible.
 
@@ -280,44 +307,75 @@ Key extraction targets:
 8. unusualMethodDetected: specific unusual method text detected, or empty string.
 9. explanation: a clear, neutral 1-2 sentence summary of what was identified in the document.`;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.7-flash",
-        contents: [
-          {
-            parts: [
-              {
-                inlineData: {
-                  mimeType,
-                  data: cleanBase64,
-                },
-              },
-              {
-                text: prompt,
-              },
-            ],
-          },
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              amount: { type: Type.NUMBER, description: "Total payment amount number, or 0 if not found" },
-              recipient: { type: Type.STRING, description: "Vendor or payee name" },
-              purpose: { type: Type.STRING, description: "Purpose of payment" },
-              paymentInstructions: { type: Type.STRING, description: "Payment instructions or account details" },
-              isUrgent: { type: Type.BOOLEAN, description: "Whether urgent pressure was detected" },
-              urgentLanguageDetected: { type: Type.STRING, description: "Urgent phrasing found or empty" },
-              isUnusualMethod: { type: Type.BOOLEAN, description: "Whether unusual channel was detected" },
-              unusualMethodDetected: { type: Type.STRING, description: "Unusual payment method detected or empty" },
-              explanation: { type: Type.STRING, description: "Neutral summary of document content" },
-            },
-            required: ["recipient", "purpose", "isUrgent", "isUnusualMethod", "explanation"],
-          },
-        },
-      });
+      let responseText = '';
 
-      const responseText = response.text?.trim();
+      if (isPdfTextParsed) {
+        const truncatedText = extractedText.substring(0, 6000);
+        const textPrompt = `${systemInstructions}\n\nDocument Text Content:\n"""\n${truncatedText}\n"""`;
+
+        const response = await ai.models.generateContent({
+          model: "gemini-3.7-flash",
+          contents: [{ parts: [{ text: textPrompt }] }],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                amount: { type: Type.NUMBER, description: "Total payment amount number, or 0 if not found" },
+                recipient: { type: Type.STRING, description: "Vendor or payee name" },
+                purpose: { type: Type.STRING, description: "Purpose of payment" },
+                paymentInstructions: { type: Type.STRING, description: "Payment instructions or account details" },
+                isUrgent: { type: Type.BOOLEAN, description: "Whether urgent pressure was detected" },
+                urgentLanguageDetected: { type: Type.STRING, description: "Urgent phrasing found or empty" },
+                isUnusualMethod: { type: Type.BOOLEAN, description: "Whether unusual channel was detected" },
+                unusualMethodDetected: { type: Type.STRING, description: "Unusual payment method detected or empty" },
+                explanation: { type: Type.STRING, description: "Neutral summary of document content" },
+              },
+              required: ["recipient", "purpose", "isUrgent", "isUnusualMethod", "explanation"],
+            },
+          },
+        });
+        responseText = response.text?.trim() || '';
+      } else {
+        const response = await ai.models.generateContent({
+          model: "gemini-3.7-flash",
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType,
+                    data: cleanBase64,
+                  },
+                },
+                {
+                  text: systemInstructions,
+                },
+              ],
+            },
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                amount: { type: Type.NUMBER, description: "Total payment amount number, or 0 if not found" },
+                recipient: { type: Type.STRING, description: "Vendor or payee name" },
+                purpose: { type: Type.STRING, description: "Purpose of payment" },
+                paymentInstructions: { type: Type.STRING, description: "Payment instructions or account details" },
+                isUrgent: { type: Type.BOOLEAN, description: "Whether urgent pressure was detected" },
+                urgentLanguageDetected: { type: Type.STRING, description: "Urgent phrasing found or empty" },
+                isUnusualMethod: { type: Type.BOOLEAN, description: "Whether unusual channel was detected" },
+                unusualMethodDetected: { type: Type.STRING, description: "Unusual payment method detected or empty" },
+                explanation: { type: Type.STRING, description: "Neutral summary of document content" },
+              },
+              required: ["recipient", "purpose", "isUrgent", "isUnusualMethod", "explanation"],
+            },
+          },
+        });
+        responseText = response.text?.trim() || '';
+      }
+
       if (!responseText) {
         return res.status(422).json({ error: "Could not extract text from document." });
       }

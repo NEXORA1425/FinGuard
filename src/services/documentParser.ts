@@ -6,14 +6,21 @@ export interface ParseDocumentResult {
   error?: string;
 }
 
+export type ParsingStage =
+  | 'Reading file...'
+  | 'Uploading document payload...'
+  | 'Parsing text & pages...'
+  | 'Analyzing document with Gemini AI...'
+  | 'Finalizing extraction details...';
+
 /**
- * Service function to parse an uploaded payment document (PDF, JPG, PNG)
+ * Service function to parse an uploaded payment document (PDF, JPG, PNG, WEBP)
  * via the backend Gemini endpoint and return structured payment details.
  */
 export async function parsePaymentDocument(
-  file: File
+  file: File,
+  onStageChange?: (stage: ParsingStage) => void
 ): Promise<ParseDocumentResult> {
-  // Validate supported mime types / extensions
   const validMimes = [
     'application/pdf',
     'image/jpeg',
@@ -30,7 +37,7 @@ export async function parsePaymentDocument(
   if (!isMimeValid && !isExtValid) {
     return {
       success: false,
-      error: "We couldn't reliably read this document. Please enter the payment details manually.",
+      error: "Unsupported file format. Please upload a PDF invoice, JPG, PNG, or WEBP image.",
     };
   }
 
@@ -38,16 +45,18 @@ export async function parsePaymentDocument(
   if (file.size > 20 * 1024 * 1024) {
     return {
       success: false,
-      error: "We couldn't reliably read this document. Please enter the payment details manually.",
+      error: "File size exceeds the 20MB maximum limit. Please upload a smaller file.",
     };
   }
 
   try {
+    onStageChange?.('Reading file...');
+
     // Read file to Base64 string
     const reader = new FileReader();
     const base64Promise = new Promise<string>((resolve, reject) => {
       reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(new Error('Failed to read file buffer'));
+      reader.onerror = () => reject(new Error('Failed to read document buffer'));
     });
     reader.readAsDataURL(file);
     const fileBase64 = await base64Promise;
@@ -55,11 +64,24 @@ export async function parsePaymentDocument(
     const mimeType =
       file.type || (fileExt === '.pdf' ? 'application/pdf' : 'image/jpeg');
 
+    onStageChange?.('Uploading document payload...');
+
+    // 25-second AbortController timeout to prevent hanging UI
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25000);
+
+    onStageChange?.('Parsing text & pages...');
+
+    const stageTimer = setTimeout(() => {
+      onStageChange?.('Analyzing document with Gemini AI...');
+    }, 1500);
+
     const response = await fetch('/api/extract-document', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
+      signal: controller.signal,
       body: JSON.stringify({
         fileBase64,
         mimeType,
@@ -67,18 +89,24 @@ export async function parsePaymentDocument(
       }),
     });
 
+    clearTimeout(timeoutId);
+    clearTimeout(stageTimer);
+
     if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
       return {
         success: false,
-        error: "We couldn't reliably read this document. Please enter the payment details manually.",
+        error: errData.error || `Server responded with status ${response.status}. Please enter details manually.`,
       };
     }
+
+    onStageChange?.('Finalizing extraction details...');
 
     const payload = await response.json();
     if (!payload.success || !payload.data) {
       return {
         success: false,
-        error: "We couldn't reliably read this document. Please enter the payment details manually.",
+        error: payload.error || "We couldn't reliably extract details from this document. Please enter details manually.",
       };
     }
 
@@ -86,11 +114,17 @@ export async function parsePaymentDocument(
       success: true,
       data: payload.data as ExtractedDocumentData,
     };
-  } catch (err) {
+  } catch (err: any) {
     console.error('Payment document parsing error:', err);
+    if (err.name === 'AbortError') {
+      return {
+        success: false,
+        error: "Document extraction timed out after 25 seconds. Please enter payment details manually.",
+      };
+    }
     return {
       success: false,
-      error: "We couldn't reliably read this document. Please enter the payment details manually.",
+      error: err.message || "Failed to process document. Please enter the payment details manually.",
     };
   }
 }

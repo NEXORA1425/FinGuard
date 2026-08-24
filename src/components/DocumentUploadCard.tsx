@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { ExtractedDocumentData } from '../types';
-import { parsePaymentDocument } from '../services/documentParser';
+import { parsePaymentDocument, ParsingStage } from '../services/documentParser';
 import { uploadDocumentApi } from '../services/documentService';
 import { useAuth } from '../context/AuthContext';
 import {
@@ -35,6 +35,7 @@ export const DocumentUploadCard: React.FC<DocumentUploadCardProps> = ({
   const { user } = useAuth();
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [currentStage, setCurrentStage] = useState<ParsingStage>('Reading file...');
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isVaultSaved, setIsVaultSaved] = useState<boolean>(false);
@@ -81,10 +82,13 @@ export const DocumentUploadCard: React.FC<DocumentUploadCardProps> = ({
     setUploadStatus('idle');
     setIsProcessing(true);
     setIsVaultSaved(false);
+    setCurrentStage('Reading file...');
 
     try {
-      // Step 1: AI Metadata Extraction via Gemini
-      const result = await parsePaymentDocument(file);
+      // Step 1: AI Metadata Extraction via Gemini + Fast pdf-parse
+      const result = await parsePaymentDocument(file, (stage) => {
+        setCurrentStage(stage);
+      });
 
       if (!result.success || !result.data) {
         setUploadStatus('error');
@@ -111,11 +115,11 @@ export const DocumentUploadCard: React.FC<DocumentUploadCardProps> = ({
         size: file.size,
         type: file.type || fileExtension.replace('.', '').toUpperCase(),
       });
-    } catch (err) {
+    } catch (err: any) {
       console.warn('Document processing error:', err);
       setUploadStatus('error');
       setErrorMessage(
-        "We couldn't reliably read this document. Please enter the payment details manually."
+        err.message || "We couldn't reliably read this document. Please enter the payment details manually."
       );
     } finally {
       setIsProcessing(false);
@@ -257,8 +261,8 @@ export const DocumentUploadCard: React.FC<DocumentUploadCardProps> = ({
           {isProcessing ? (
             <div id="upload-status-processing" className="py-4 space-y-3">
               <Loader2 className="w-7 h-7 sm:w-8 sm:h-8 text-slate-800 animate-spin mx-auto" />
-              <p className="text-sm font-bold text-slate-900">
-                Analyzing payment document with Gemini AI...
+              <p className="text-sm font-bold text-slate-900 animate-pulse">
+                {currentStage}
               </p>
               <p className="text-xs text-slate-500 max-w-xs mx-auto">
                 Extracting payee name, total amount, urgency phrasing, and account instructions.
