@@ -18,12 +18,12 @@ export type ParsingStage =
   | 'Finalizing extraction details...';
 
 /**
- * Production-Safe Document Parsing Service via Supabase Storage
+ * Production Supabase Storage Document Upload & Parsing Service
  * 1. Validates file locally (MIME, extension, 20MB size).
- * 2. Requests signed upload URL / path authorization from /api/create-upload-url.
- * 3. Uploads file directly to private Supabase Storage bucket 'payment-documents'.
- * 4. Passes storage reference (bucket & path) to /api/extract-document.
- * 5. Returns structured payment analysis payload.
+ * 2. Requests signed upload URL from /api/create-upload-url.
+ * 3. Uploads File directly to private Supabase Storage bucket 'payment-documents' via uploadToSignedUrl.
+ * 4. Validates upload success BEFORE calling /api/extract-document with ONLY bucket & path (No Base64!).
+ * 5. Returns structured payment risk analysis.
  */
 export async function parsePaymentDocument(
   file: File,
@@ -67,7 +67,7 @@ export async function parsePaymentDocument(
 
     onStageChange?.('Requesting upload authorization...');
 
-    // Step 1: Request upload URL / storage path authorization from backend
+    // 1. Request signed upload URL from backend
     const authRes = await fetch('/api/create-upload-url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -78,57 +78,35 @@ export async function parsePaymentDocument(
       }),
     });
 
-    let storageBucket = BUCKET_NAME;
-    let storagePath = `anonymous/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-    let signedToken: string | null = null;
+    const authData = await authRes.json().catch(() => ({}));
 
-    if (authRes.ok) {
-      const authData = await authRes.json();
-      if (authData.success) {
-        storageBucket = authData.bucket || BUCKET_NAME;
-        storagePath = authData.path || storagePath;
-        signedToken = authData.token || null;
-      }
+    if (!authRes.ok || !authData.success || !authData.token || !authData.path) {
+      return {
+        success: false,
+        errorCode: authData.error || 'UPLOAD_AUTHORIZATION_FAILED',
+        error: authData.message || 'Unable to prepare secure file upload.',
+      };
     }
+
+    const { bucket, path: storagePath, token: signedToken } = authData;
 
     onStageChange?.('Uploading file to Supabase Storage...');
 
-    // Step 2: Upload File directly to Supabase Storage
-    let isUploadSuccessful = false;
+    // 2. Upload File directly to Supabase Storage via signed URL token (NO Base64!)
+    const { error: uploadErr } = await supabase.storage
+      .from(bucket || BUCKET_NAME)
+      .uploadToSignedUrl(storagePath, signedToken, file, {
+        contentType: mimeType,
+        upsert: true,
+      });
 
-    if (signedToken) {
-      try {
-        const { error: signedUploadErr } = await supabase.storage
-          .from(storageBucket)
-          .uploadToSignedUrl(storagePath, signedToken, file, {
-            contentType: mimeType,
-            upsert: true,
-          });
-
-        if (!signedUploadErr) {
-          isUploadSuccessful = true;
-        } else {
-          console.warn('Signed URL upload warning:', signedUploadErr.message);
-        }
-      } catch (sErr) {
-        console.warn('Signed upload exception:', sErr);
-      }
-    }
-
-    // Direct Supabase storage fallback upload if signed token was not returned
-    if (!isUploadSuccessful) {
-      const { error: directUploadErr } = await supabase.storage
-        .from(storageBucket)
-        .upload(storagePath, file, {
-          contentType: mimeType,
-          upsert: true,
-        });
-
-      if (!directUploadErr) {
-        isUploadSuccessful = true;
-      } else {
-        console.warn('Direct Supabase upload notice:', directUploadErr.message);
-      }
+    if (uploadErr) {
+      console.error('Supabase signed upload error:', uploadErr.message);
+      return {
+        success: false,
+        errorCode: 'UPLOAD_FAILED',
+        error: 'Failed to upload document to storage. Please try again.',
+      };
     }
 
     onStageChange?.('Uploaded');
@@ -143,33 +121,20 @@ export async function parsePaymentDocument(
       onStageChange?.('Analyzing document with Gemini AI...');
     }, 1200);
 
-    // Step 3: Send storage path reference (NOT Base64) to extraction API!
-    let extractionPayload: any = {
-      bucket: storageBucket,
-      path: storagePath,
-      fileName: file.name,
-      mimeType,
-      fileSize: file.size,
-    };
-
-    // If Supabase upload was blocked by browser network, fallback to base64 for small files
-    if (!isUploadSuccessful && file.size <= 3 * 1024 * 1024) {
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve, reject) => {
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = () => reject(new Error('Failed to read document buffer'));
-      });
-      reader.readAsDataURL(file);
-      extractionPayload.fileBase64 = await base64Promise;
-    }
-
+    // 3. Send ONLY storage path reference to extraction API
     const response = await fetch('/api/extract-document', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       signal: controller.signal,
-      body: JSON.stringify(extractionPayload),
+      body: JSON.stringify({
+        bucket: bucket || BUCKET_NAME,
+        path: storagePath,
+        fileName: file.name,
+        mimeType,
+        fileSize: file.size,
+      }),
     });
 
     clearTimeout(timeoutId);
@@ -191,7 +156,7 @@ export async function parsePaymentDocument(
       return {
         success: false,
         errorCode: 'EMPTY_DOCUMENT',
-        error: "We couldn't extract details from this document. Please enter details manually.",
+        error: "We couldn't extract payment details from this document. Please enter details manually.",
       };
     }
 

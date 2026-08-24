@@ -1,23 +1,17 @@
 import { StoredDocument, ExtractedDocumentData } from '../types';
 import { getStoredToken } from './authService';
+import { BUCKET_NAME } from '../supabase';
 
 export async function uploadDocumentApi(
   file: File,
-  extractedData?: ExtractedDocumentData
+  extractedData?: ExtractedDocumentData,
+  storagePath?: string,
+  storageBucket?: string
 ): Promise<StoredDocument> {
   const token = getStoredToken();
   if (!token) {
     throw new Error('You must be logged in to store documents.');
   }
-
-  // Convert File to Base64
-  const reader = new FileReader();
-  const base64Promise = new Promise<string>((resolve, reject) => {
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(new Error('Failed to read document content'));
-  });
-  reader.readAsDataURL(file);
-  const fileBase64 = await base64Promise;
 
   const response = await fetch('/api/documents/upload', {
     method: 'POST',
@@ -29,14 +23,15 @@ export async function uploadDocumentApi(
       fileName: file.name,
       fileSize: file.size,
       mimeType: file.type || 'application/octet-stream',
-      fileBase64,
+      storageBucket: storageBucket || BUCKET_NAME,
+      storagePath: storagePath || `documents/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`,
       extractedData,
     }),
   });
 
   const data = await response.json();
   if (!response.ok || !data.success) {
-    throw new Error(data.error || 'Document upload failed.');
+    throw new Error(data.error || 'Document registration failed.');
   }
 
   return data.document as StoredDocument;

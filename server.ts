@@ -4,11 +4,7 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import { processDocumentExtraction } from "./src/services/extractionEngine";
-import { supabaseAdmin, BUCKET_NAME } from "./src/supabase";
-
-
-
-
+import { getSupabaseAdmin, BUCKET_NAME } from "./src/supabase";
 
 // In-Memory Database & Persistence Types
 interface UserRecord {
@@ -28,7 +24,8 @@ interface StoredDocumentRecord {
   fileSize: number;
   mimeType: string;
   uploadedAt: string;
-  fileBase64: string; // Base64 content
+  storageBucket: string;
+  storagePath: string;
   extractedData: any;
 }
 
@@ -272,25 +269,17 @@ export async function createExpressApp() {
       const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
       const storagePath = `anonymous/${fileId}-${sanitizedName}`;
 
-      try {
-        await supabaseAdmin.storage.createBucket(BUCKET_NAME, {
-          public: false,
-          fileSizeLimit: 20971520,
-          allowedMimeTypes: validMimes,
-        });
-      } catch (_) {}
-
+      const supabaseAdmin = getSupabaseAdmin();
       const { data, error } = await supabaseAdmin.storage
         .from(BUCKET_NAME)
         .createSignedUploadUrl(storagePath);
 
-      if (error || !data) {
-        return res.json({
-          success: true,
-          bucket: BUCKET_NAME,
-          path: storagePath,
-          signedUrl: null,
-          token: null,
+      if (error || !data || !data.token || !data.signedUrl) {
+        console.error('[CREATE_UPLOAD_URL_FAILED]', error ? error.message : 'No signed token returned');
+        return res.status(500).json({
+          success: false,
+          error: 'UPLOAD_AUTHORIZATION_FAILED',
+          message: 'Unable to prepare secure file upload.',
         });
       }
 
@@ -302,11 +291,11 @@ export async function createExpressApp() {
         token: data.token,
       });
     } catch (error: any) {
-      console.error('[CREATE_UPLOAD_URL_ERROR]', error);
+      console.error('[CREATE_UPLOAD_URL_EXCEPTION]', error);
       return res.status(500).json({
         success: false,
-        error: 'STORAGE_ERROR',
-        message: error.message || 'Failed to create upload authorization.',
+        error: 'UPLOAD_AUTHORIZATION_FAILED',
+        message: error.message || 'Unable to prepare secure file upload.',
       });
     }
   });
@@ -314,65 +303,73 @@ export async function createExpressApp() {
   // Document extraction API using Supabase Storage download & extraction engine
   app.post("/api/extract-document", async (req, res) => {
     try {
-      const { bucket, path, storageUrl, fileBase64, mimeType, fileName, fileSize } = req.body || {};
+      const { bucket, path: storagePath, mimeType, fileName, fileSize } = req.body || {};
 
-      let fileBuffer: Buffer | undefined;
-
-      // 1. Download document from Supabase Storage using bucket and path
-      if (path) {
-        const targetBucket = bucket || BUCKET_NAME;
-        try {
-          const { data: blobData, error: downloadErr } = await supabaseAdmin.storage
-            .from(targetBucket)
-            .download(path);
-
-          if (blobData && !downloadErr) {
-            const arrayBuffer = await blobData.arrayBuffer();
-            fileBuffer = Buffer.from(arrayBuffer);
-            console.log(`[SERVER_EXTRACT] Successfully downloaded ${fileBuffer.length} bytes from Supabase Storage (${targetBucket}/${path})`);
-          } else if (downloadErr) {
-            console.warn(`[SERVER_EXTRACT] Supabase download error for path ${path}:`, downloadErr.message);
-          }
-        } catch (subErr) {
-          console.warn(`[SERVER_EXTRACT] Exception downloading from Supabase Storage:`, subErr);
-        }
-      }
-
-      // 2. Secondary fallback: storageUrl download
-      if (!fileBuffer && storageUrl && String(storageUrl).startsWith('http')) {
-        try {
-          const fetchRes = await fetch(storageUrl);
-          if (fetchRes.ok) {
-            const arrayBuffer = await fetchRes.arrayBuffer();
-            fileBuffer = Buffer.from(arrayBuffer);
-          }
-        } catch (fetchErr) {
-          console.warn('[SERVER_EXTRACT] Failed to fetch storageUrl:', fetchErr);
-        }
-      }
-
-      if (!fileBase64 && !fileBuffer) {
+      if (!bucket || !storagePath || !mimeType) {
         return res.status(400).json({
           success: false,
           error: 'DOWNLOAD_FAILED',
-          message: 'Could not retrieve document from Supabase Storage. Please try uploading again or enter details manually.',
+          message: 'Missing required storage reference (bucket, path, mimeType).',
+        });
+      }
+
+      if (bucket !== BUCKET_NAME) {
+        return res.status(403).json({
+          success: false,
+          error: 'STORAGE_ERROR',
+          message: 'Forbidden. Access to unauthorized storage buckets is blocked.',
+        });
+      }
+
+      const cleanPath = String(storagePath).trim();
+      if (!cleanPath.includes('/')) {
+        return res.status(400).json({
+          success: false,
+          error: 'STORAGE_ERROR',
+          message: 'Invalid storage path structure.',
+        });
+      }
+
+      let fileBuffer: Buffer | undefined;
+
+      try {
+        const supabaseAdmin = getSupabaseAdmin();
+        const { data: blobData, error: downloadErr } = await supabaseAdmin.storage
+          .from(BUCKET_NAME)
+          .download(cleanPath);
+
+        if (downloadErr || !blobData) {
+          console.error('[SERVER_EXTRACT_DOWNLOAD_FAILED]', downloadErr ? downloadErr.message : 'No blob returned');
+          return res.status(400).json({
+            success: false,
+            error: 'DOWNLOAD_FAILED',
+            message: 'Could not retrieve document from Supabase Storage. Please try uploading again.',
+          });
+        }
+
+        const arrayBuffer = await blobData.arrayBuffer();
+        fileBuffer = Buffer.from(arrayBuffer);
+      } catch (adminErr: any) {
+        console.error('[SERVER_EXTRACT_ADMIN_EXCEPT]', adminErr);
+        return res.status(500).json({
+          success: false,
+          error: 'DOWNLOAD_FAILED',
+          message: adminErr.message || 'Server error while retrieving document from Supabase Storage.',
         });
       }
 
       const result = await processDocumentExtraction({
-        fileBase64,
         fileBuffer,
-        mimeType: mimeType || 'application/pdf',
+        mimeType,
         fileName,
-        fileSize,
+        fileSize: fileSize || fileBuffer.length,
       });
 
-      if (path && result.success) {
-        supabaseAdmin.storage
-          .from(bucket || BUCKET_NAME)
-          .remove([path])
-          .then(() => console.log(`[SERVER_EXTRACT] Cleaned up temporary storage path: ${path}`))
-          .catch(() => {});
+      if (result.success && cleanPath.startsWith('anonymous/')) {
+        try {
+          const supabaseAdmin = getSupabaseAdmin();
+          await supabaseAdmin.storage.from(BUCKET_NAME).remove([cleanPath]);
+        } catch (_) {}
       }
 
       if (!result.success) {
@@ -391,19 +388,18 @@ export async function createExpressApp() {
     }
   });
 
-  // POST /api/documents/upload - Store document securely
+  // POST /api/documents/upload - Store document reference securely (No Base64 bytes stored)
   app.post("/api/documents/upload", async (req, res) => {
     const user = getAuthUser(req);
     if (!user) {
       return res.status(401).json({ error: "You must be logged in to upload documents." });
     }
 
-    const { fileName, fileSize, mimeType, fileBase64, extractedData } = req.body;
-    if (!fileName || !fileBase64) {
-      return res.status(400).json({ error: "File name and file content are required." });
+    const { fileName, fileSize, mimeType, storageBucket, storagePath, extractedData } = req.body || {};
+    if (!fileName || !storagePath) {
+      return res.status(400).json({ error: "File name and storage path reference are required." });
     }
 
-    // Size check max 20MB
     if (fileSize && fileSize > 20 * 1024 * 1024) {
       return res.status(400).json({ error: "File size exceeds the 20MB maximum limit." });
     }
@@ -415,14 +411,15 @@ export async function createExpressApp() {
       userEmail: user.email,
       fileName,
       fileSize: fileSize || 0,
-      mimeType: mimeType || "application/octet-stream",
+      mimeType: mimeType || "application/pdf",
       uploadedAt: new Date().toISOString(),
-      fileBase64,
+      storageBucket: storageBucket || BUCKET_NAME,
+      storagePath: storagePath,
       extractedData: extractedData || null,
     };
 
     documentsStore.set(docId, storedDoc);
-    recordAudit("DOCUMENT_UPLOAD", user.email, `Uploaded payment document: ${fileName} (${(fileSize/1024).toFixed(1)} KB)`);
+    recordAudit("DOCUMENT_UPLOAD", user.email, `Uploaded payment document reference: ${fileName} (${(fileSize/1024).toFixed(1)} KB)`);
 
     const downloadUrl = `/api/documents/${docId}/download`;
 
@@ -474,8 +471,8 @@ export async function createExpressApp() {
     });
   });
 
-  // GET /api/documents/:id/download - Secure download endpoint
-  app.get("/api/documents/:id/download", (req, res) => {
+  // GET /api/documents/:id/download - Secure download endpoint via Supabase Storage download
+  app.get("/api/documents/:id/download", async (req, res) => {
     const user = getAuthUser(req);
     if (!user) {
       return res.status(401).send("Unauthorized. Log in to access private documents.");
@@ -488,7 +485,6 @@ export async function createExpressApp() {
       return res.status(404).send("Document not found.");
     }
 
-    // Role Security: User can only download their own document; Admin can download any
     if (user.role !== 'admin' && storedDoc.userId !== user.id) {
       recordAudit("SECURITY_DENIED", user.email, `Unauthorized attempt to download document ${docId} belonging to ${storedDoc.userEmail}`, "critical");
       return res.status(403).send("Forbidden. You do not have permission to access another user's document.");
@@ -496,12 +492,26 @@ export async function createExpressApp() {
 
     recordAudit("DOCUMENT_DOWNLOAD", user.email, `Downloaded document ${storedDoc.fileName} (${docId})`);
 
-    const cleanBase64 = storedDoc.fileBase64.replace(/^data:[^;]+;base64,/, '');
-    const buffer = Buffer.from(cleanBase64, 'base64');
+    try {
+      const supabaseAdmin = getSupabaseAdmin();
+      const { data: blobData, error: downloadErr } = await supabaseAdmin.storage
+        .from(storedDoc.storageBucket || BUCKET_NAME)
+        .download(storedDoc.storagePath);
 
-    res.setHeader('Content-Type', storedDoc.mimeType);
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(storedDoc.fileName)}"`);
-    return res.send(buffer);
+      if (downloadErr || !blobData) {
+        return res.status(404).send("Document file not found in storage bucket.");
+      }
+
+      const arrayBuffer = await blobData.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      res.setHeader('Content-Type', storedDoc.mimeType);
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(storedDoc.fileName)}"`);
+      return res.send(buffer);
+    } catch (err: any) {
+      console.error('Error downloading stored document from Supabase:', err);
+      return res.status(500).send("Error retrieving file from document storage.");
+    }
   });
 
   // DELETE /api/documents/:id

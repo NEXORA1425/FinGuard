@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { processDocumentExtraction } from '../src/services/extractionEngine';
-import { supabaseAdmin, BUCKET_NAME } from '../src/supabase';
+import { getSupabaseAdmin, BUCKET_NAME } from '../src/supabase';
 
 export const config = {
   maxDuration: 30, // 30 second maximum timeout on Vercel
@@ -29,68 +29,79 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { bucket, path, storageUrl, fileBase64, mimeType, fileName, fileSize } = req.body || {};
+    const { bucket, path, mimeType, fileName, fileSize } = req.body || {};
 
-    let fileBuffer: Buffer | undefined;
-
-    // 1. Download document from Supabase Storage using bucket and path
-    if (path) {
-      const targetBucket = bucket || BUCKET_NAME;
-      try {
-        const { data: blobData, error: downloadErr } = await supabaseAdmin.storage
-          .from(targetBucket)
-          .download(path);
-
-        if (blobData && !downloadErr) {
-          const arrayBuffer = await blobData.arrayBuffer();
-          fileBuffer = Buffer.from(arrayBuffer);
-          console.log(`[VERCEL_EXTRACT] Successfully downloaded ${fileBuffer.length} bytes from Supabase Storage (${targetBucket}/${path})`);
-        } else if (downloadErr) {
-          console.warn(`[VERCEL_EXTRACT] Supabase download error for path ${path}:`, downloadErr.message);
-        }
-      } catch (subErr) {
-        console.warn(`[VERCEL_EXTRACT] Exception downloading from Supabase Storage:`, subErr);
-      }
-    }
-
-    // 2. Secondary fallback: storageUrl download
-    if (!fileBuffer && storageUrl && String(storageUrl).startsWith('http')) {
-      try {
-        const fetchRes = await fetch(storageUrl);
-        if (fetchRes.ok) {
-          const arrayBuffer = await fetchRes.arrayBuffer();
-          fileBuffer = Buffer.from(arrayBuffer);
-        }
-      } catch (fetchErr) {
-        console.warn('[VERCEL_EXTRACT] Failed to fetch storageUrl server-side:', fetchErr);
-      }
-    }
-
-    // 3. Validation Check
-    if (!fileBase64 && !fileBuffer) {
+    // 1. Require bucket, path, mimeType, fileName
+    if (!bucket || !path || !mimeType) {
       return res.status(400).json({
         success: false,
         error: 'DOWNLOAD_FAILED',
-        message: 'Could not retrieve document from Supabase Storage. Please try uploading again or enter details manually.',
+        message: 'Missing required storage reference (bucket, path, mimeType).',
       });
     }
 
-    // 4. Process Document Extraction Engine
+    // 2. Strict Bucket Security — Only allow 'payment-documents'
+    if (bucket !== BUCKET_NAME) {
+      return res.status(403).json({
+        success: false,
+        error: 'STORAGE_ERROR',
+        message: 'Forbidden. Access to unauthorized storage buckets is blocked.',
+      });
+    }
+
+    // 3. Namespace Validation — Ensure path starts with safe folder (e.g., anonymous/ or user-id/)
+    const cleanPath = String(path).trim();
+    if (!cleanPath.includes('/')) {
+      return res.status(400).json({
+        success: false,
+        error: 'STORAGE_ERROR',
+        message: 'Invalid storage path structure.',
+      });
+    }
+
+    // 4. Download file from Supabase Storage using SERVER-SIDE Supabase admin client
+    let fileBuffer: Buffer | undefined;
+
+    try {
+      const supabaseAdmin = getSupabaseAdmin();
+      const { data: blobData, error: downloadErr } = await supabaseAdmin.storage
+        .from(BUCKET_NAME)
+        .download(cleanPath);
+
+      if (downloadErr || !blobData) {
+        console.error('[EXTRACT_DOCUMENT_DOWNLOAD_FAILED]', downloadErr ? downloadErr.message : 'No data returned');
+        return res.status(400).json({
+          success: false,
+          error: 'DOWNLOAD_FAILED',
+          message: 'Could not retrieve document from Supabase Storage. Please try uploading again.',
+        });
+      }
+
+      const arrayBuffer = await blobData.arrayBuffer();
+      fileBuffer = Buffer.from(arrayBuffer);
+    } catch (adminErr: any) {
+      console.error('[EXTRACT_DOCUMENT_ADMIN_EXCEPT]', adminErr);
+      return res.status(500).json({
+        success: false,
+        error: 'DOWNLOAD_FAILED',
+        message: adminErr.message || 'Server configuration error while retrieving document.',
+      });
+    }
+
+    // 5. Process Document Extraction Engine
     const result = await processDocumentExtraction({
-      fileBase64,
       fileBuffer,
-      mimeType: mimeType || 'application/pdf',
+      mimeType,
       fileName,
-      fileSize,
+      fileSize: fileSize || fileBuffer.length,
     });
 
-    // 5. Cleanup temporary storage file if requested/applicable
-    if (path && result.success) {
-      supabaseAdmin.storage
-        .from(bucket || BUCKET_NAME)
-        .remove([path])
-        .then(() => console.log(`[VERCEL_EXTRACT] Cleaned up temporary storage path: ${path}`))
-        .catch(() => {});
+    // 6. Lifecycle Cleanup: Delete temporary upload after successful extraction
+    if (result.success && cleanPath.startsWith('anonymous/')) {
+      try {
+        const supabaseAdmin = getSupabaseAdmin();
+        await supabaseAdmin.storage.from(BUCKET_NAME).remove([cleanPath]);
+      } catch (_) {}
     }
 
     if (!result.success) {
@@ -100,7 +111,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     return res.json(result);
   } catch (error: any) {
-    console.error('[VERCEL_EXTRACT_EXCEPTION]', error);
+    console.error('[EXTRACT_DOCUMENT_EXCEPTION]', error);
     return res.status(422).json({
       success: false,
       error: 'INTERNAL_ERROR',

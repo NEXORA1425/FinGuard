@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { supabaseAdmin, BUCKET_NAME } from '../src/supabase';
+import { getSupabaseAdmin, BUCKET_NAME } from '../src/supabase';
 
 export const config = {
   maxDuration: 15,
@@ -60,35 +60,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // Generate secure random path
-    const fileId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+    // Generate secure random UUID path (no client path override allowed)
+    const fileId = `${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
     const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
     const storagePath = `anonymous/${fileId}-${sanitizedName}`;
 
-    // Ensure bucket exists or create if needed
-    try {
-      await supabaseAdmin.storage.createBucket(BUCKET_NAME, {
-        public: false,
-        fileSizeLimit: 20971520,
-        allowedMimeTypes: validMimes,
-      });
-    } catch (_) {
-      // Bucket may already exist, ignore error
-    }
+    // Get Server-Side Admin Client (Service Role Key required)
+    const supabaseAdmin = getSupabaseAdmin();
 
-    // Create signed upload URL from Supabase Storage
+    // Create signed upload URL from private Supabase Storage bucket
     const { data, error } = await supabaseAdmin.storage
       .from(BUCKET_NAME)
       .createSignedUploadUrl(storagePath);
 
-    if (error || !data) {
-      // Fallback path if createSignedUploadUrl is restricted
-      return res.json({
-        success: true,
-        bucket: BUCKET_NAME,
-        path: storagePath,
-        signedUrl: null,
-        token: null,
+    if (error || !data || !data.token || !data.signedUrl) {
+      console.error('[CREATE_UPLOAD_URL_FAILED]', error ? error.message : 'No signed token returned');
+      return res.status(500).json({
+        success: false,
+        error: 'UPLOAD_AUTHORIZATION_FAILED',
+        message: 'Unable to prepare secure file upload. Storage bucket authorization failed.',
       });
     }
 
@@ -100,11 +90,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       token: data.token,
     });
   } catch (error: any) {
-    console.error('[CREATE_UPLOAD_URL_ERROR]', error);
+    console.error('[CREATE_UPLOAD_URL_EXCEPTION]', error);
     return res.status(500).json({
       success: false,
-      error: 'STORAGE_ERROR',
-      message: error.message || 'Failed to create upload authorization.',
+      error: 'UPLOAD_AUTHORIZATION_FAILED',
+      message: error.message || 'Unable to prepare secure file upload.',
     });
   }
 }
