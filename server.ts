@@ -118,7 +118,7 @@ function getAuthUser(req: express.Request): UserRecord | null {
   return usersStore.get(email) || null;
 }
 
-async function startServer() {
+export async function createExpressApp() {
   const app = express();
   const PORT = 3000;
 
@@ -580,13 +580,13 @@ Key extraction targets:
   // VITE MIDDLEWARE & STATIC SERVING
   // ==========================================
 
-  if (process.env.NODE_ENV !== "production") {
+  if (process.env.NODE_ENV !== "production" && process.env.VERCEL !== "1") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (process.env.VERCEL !== "1") {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -594,10 +594,19 @@ Key extraction targets:
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`FinGuard server running on http://localhost:${PORT}`);
-  });
+  if (process.env.VERCEL !== "1") {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`FinGuard server running on http://localhost:${PORT}`);
+    });
+  }
+
+  return app;
 }
 
-startServer();
+export const appPromise = createExpressApp();
+export default async function handler(req: any, res: any) {
+  const app = await appPromise;
+  return app(req, res);
+}
+
 
