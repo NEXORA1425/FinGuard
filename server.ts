@@ -3,9 +3,8 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import * as pdfParseModule from "pdf-parse";
+import { processDocumentExtraction } from "./src/services/extractionEngine";
 
-const pdfParse = (pdfParseModule as any).default || pdfParseModule;
 
 
 
@@ -232,206 +231,54 @@ export async function createExpressApp() {
   // DOCUMENT EXTRACTION & UPLOAD ROUTES
   // ==========================================
 
-  // Document extraction API using Gemini & pdf-parse
+  // Document extraction API using unified processDocumentExtraction engine
   app.post("/api/extract-document", async (req, res) => {
-    const startTime = Date.now();
     try {
-      const { fileBase64, mimeType, fileName } = req.body || {};
-      if (!fileBase64 || !mimeType) {
-        return res.status(400).json({ error: "Missing file data or mime type." });
-      }
+      const { fileBase64, storageUrl, mimeType, fileName, fileSize } = req.body || {};
 
-      const cleanMime = String(mimeType).toLowerCase();
-      const cleanFileName = String(fileName || '').toLowerCase();
-      const isPdf = cleanMime.includes('pdf') || cleanFileName.endsWith('.pdf');
-      const isImage = cleanMime.includes('image') || /\.(jpg|jpeg|png|webp)$/.test(cleanFileName);
+      let fileBuffer: Buffer | undefined;
 
-      if (!isPdf && !isImage) {
-        return res.status(400).json({ error: "Unsupported file format. Please upload a PDF, JPG, PNG, or WEBP document." });
-      }
-
-      const cleanBase64 = fileBase64.replace(/^data:[^;]+;base64,/, '');
-      const estimatedSizeBytes = Math.round((cleanBase64.length * 3) / 4);
-
-      if (estimatedSizeBytes > 20 * 1024 * 1024) {
-        return res.status(400).json({ error: "File size exceeds the 20MB maximum limit." });
-      }
-
-      const apiKey = process.env.GEMINI_API_KEY;
-      const isApiKeyConfigured = Boolean(apiKey && apiKey.trim() !== '' && !apiKey.includes('YOUR_GEMINI_API_KEY'));
-
-      let pdfExtractedText = '';
-      let isPdfTextParsed = false;
-
-      // Fast PDF Text Extraction via pdf-parse
-      if (mimeType.toLowerCase().includes('pdf') || (fileName && fileName.toLowerCase().endsWith('.pdf'))) {
+      if (storageUrl && String(storageUrl).startsWith('http')) {
         try {
-          const fileBuffer = Buffer.from(cleanBase64, 'base64');
-          const pdfData = await pdfParse(fileBuffer);
-          pdfExtractedText = (pdfData.text || '').trim();
-          if (pdfExtractedText.length > 15) {
-            isPdfTextParsed = true;
+          const fetchRes = await fetch(storageUrl);
+          if (fetchRes.ok) {
+            const arrayBuffer = await fetchRes.arrayBuffer();
+            fileBuffer = Buffer.from(arrayBuffer);
           }
-        } catch (e) {
-          console.warn('[SERVER] pdf-parse fallback warning:', e);
+        } catch (fetchErr) {
+          console.warn('[SERVER_EXTRACT] Failed to fetch storageUrl:', fetchErr);
         }
       }
 
-      if (!isApiKeyConfigured) {
-        let fallbackData;
-        if (isPdfTextParsed) {
-          fallbackData = {
-            amount: (pdfExtractedText.match(/(?:inr|rs\.?|₹|\$)\s*([\d,]+)/i) || [])[1] ? parseFloat((pdfExtractedText.match(/(?:inr|rs\.?|₹|\$)\s*([\d,]+)/i) || [])[1].replace(/,/g, '')) : 15000,
-            recipient: (pdfExtractedText.match(/(?:vendor|payee|merchant|from|to)\s*[:=]\s*([^\n\r,]+)/i) || [])[1] || "Parsed Payee",
-            purpose: "Parsed Invoice Payment",
-            paymentInstructions: "Pay via Bank Transfer",
-            isUrgent: /urgent|immediate/i.test(pdfExtractedText),
-            urgentLanguageDetected: "",
-            isUnusualMethod: false,
-            unusualMethodDetected: "",
-            explanation: "Parsed key payment details directly from PDF text.",
-          };
-        } else {
-          fallbackData = {
-            amount: 15000,
-            recipient: "Sample Invoice Payee",
-            purpose: "Consulting & Services Invoice",
-            paymentInstructions: "Pay via Bank Transfer to ACC 9876543210",
-            isUrgent: false,
-            urgentLanguageDetected: "",
-            isUnusualMethod: false,
-            unusualMethodDetected: "",
-            explanation: "Parsed standard services invoice sample (Local fallback).",
-          };
-        }
-        return res.json({ success: true, data: fallbackData });
+      if (!fileBase64 && !fileBuffer) {
+        return res.status(400).json({
+          success: false,
+          error: 'INVALID_FILE_TYPE',
+          message: 'Missing file data, base64 payload, or storage URL.',
+        });
       }
 
-      const ai = new GoogleGenAI({
-        apiKey: apiKey!,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
+      const result = await processDocumentExtraction({
+        fileBase64,
+        fileBuffer,
+        mimeType,
+        fileName,
+        fileSize,
       });
 
-      const systemInstructions = `You are a financial document analyzer for FinGuard, a decision-safety assistant.
-Extract key payment details from this document (invoice, bill, quotation, payment request, or screenshot).
-Do not accuse the document or claim it is fraudulent. Objectively extract what is visible.
-
-Key extraction targets:
-1. amount: numeric value of the total payment amount. If found, return as a number (e.g. 50000 or 1250.50). If unknown or not found, return 0.
-2. recipient: vendor name, merchant, person, or organization requested to be paid.
-3. purpose: brief context or item description for this payment.
-4. paymentInstructions: payment method details, bank accounts, UPI IDs, or instructions specified.
-5. isUrgent: true if the document uses urgent phrasing, penalty threats, or immediate time pressure ("due in 15 mins", "immediate transfer required", "final notice before cutoff"). Otherwise false.
-6. urgentLanguageDetected: specific urgency text detected, or empty string.
-7. isUnusualMethod: true if the document directs payment via unusual routes (e.g., personal QR code in chat, crypto, gift cards, unfamiliar private account). Otherwise false.
-8. unusualMethodDetected: specific unusual method text detected, or empty string.
-9. explanation: a clear, neutral 1-2 sentence summary of what was identified in the document.`;
-
-      let responseText = '';
-      const candidateModels = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash'];
-
-      for (const modelName of candidateModels) {
-        try {
-          if (isPdfTextParsed) {
-            const truncatedText = pdfExtractedText.substring(0, 6000);
-            const textPrompt = `${systemInstructions}\n\nDocument Text Content:\n"""\n${truncatedText}\n"""`;
-
-            const response = await ai.models.generateContent({
-              model: modelName,
-              contents: [{ parts: [{ text: textPrompt }] }],
-              config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    amount: { type: Type.NUMBER, description: "Total payment amount number, or 0 if not found" },
-                    recipient: { type: Type.STRING, description: "Vendor or payee name" },
-                    purpose: { type: Type.STRING, description: "Purpose of payment" },
-                    paymentInstructions: { type: Type.STRING, description: "Payment instructions or account details" },
-                    isUrgent: { type: Type.BOOLEAN, description: "Whether urgent pressure was detected" },
-                    urgentLanguageDetected: { type: Type.STRING, description: "Urgent phrasing found or empty" },
-                    isUnusualMethod: { type: Type.BOOLEAN, description: "Whether unusual channel was detected" },
-                    unusualMethodDetected: { type: Type.STRING, description: "Unusual payment method detected or empty" },
-                    explanation: { type: Type.STRING, description: "Neutral summary of document content" },
-                  },
-                  required: ["recipient", "purpose", "isUrgent", "isUnusualMethod", "explanation"],
-                },
-              },
-            });
-            responseText = response.text?.trim() || '';
-          } else {
-            const response = await ai.models.generateContent({
-              model: modelName,
-              contents: [
-                {
-                  parts: [
-                    { inlineData: { mimeType, data: cleanBase64 } },
-                    { text: systemInstructions },
-                  ],
-                },
-              ],
-              config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    amount: { type: Type.NUMBER, description: "Total payment amount number, or 0 if not found" },
-                    recipient: { type: Type.STRING, description: "Vendor or payee name" },
-                    purpose: { type: Type.STRING, description: "Purpose of payment" },
-                    paymentInstructions: { type: Type.STRING, description: "Payment instructions or account details" },
-                    isUrgent: { type: Type.BOOLEAN, description: "Whether urgent pressure was detected" },
-                    urgentLanguageDetected: { type: Type.STRING, description: "Urgent phrasing found or empty" },
-                    isUnusualMethod: { type: Type.BOOLEAN, description: "Whether unusual channel was detected" },
-                    unusualMethodDetected: { type: Type.STRING, description: "Unusual payment method detected or empty" },
-                    explanation: { type: Type.STRING, description: "Neutral summary of document content" },
-                  },
-                  required: ["recipient", "purpose", "isUrgent", "isUnusualMethod", "explanation"],
-                },
-              },
-            });
-            responseText = response.text?.trim() || '';
-          }
-
-          if (responseText && responseText.length > 0) {
-            break;
-          }
-        } catch (mErr) {
-          console.warn(`[SERVER] Model ${modelName} attempt error:`, mErr);
-        }
+      if (!result.success) {
+        const isBadRequest = result.error === 'FILE_TOO_LARGE' || result.error === 'INVALID_FILE_TYPE';
+        return res.status(isBadRequest ? 400 : 422).json(result);
       }
 
-      if (!responseText) {
-        if (isPdfTextParsed) {
-          return res.json({
-            success: true,
-            data: {
-              amount: 15000,
-              recipient: "Parsed Document Payee",
-              purpose: "Document Payment Invoice",
-              paymentInstructions: "Pay via Bank Transfer",
-              isUrgent: false,
-              urgentLanguageDetected: "",
-              isUnusualMethod: false,
-              unusualMethodDetected: "",
-              explanation: "Parsed details directly from PDF document.",
-            },
-          });
-        }
-        return res.status(422).json({ error: "Could not extract text from document." });
-      }
-
-      const parsed = JSON.parse(responseText);
-      return res.json({
-        success: true,
-        data: parsed,
-      });
+      return res.json(result);
     } catch (error: any) {
-      console.error("Gemini document extraction error:", error);
-      return res.status(422).json({ error: error.message || "Failed to process document" });
+      console.error('[SERVER_EXTRACT_EXCEPTION]', error);
+      return res.status(422).json({
+        success: false,
+        error: 'INTERNAL_ERROR',
+        message: error.message || 'Document extraction failed.',
+      });
     }
   });
 
