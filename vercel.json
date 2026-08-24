@@ -4,6 +4,10 @@
   "outputDirectory": "dist",
   "rewrites": [
     {
+      "source": "/api/create-upload-url",
+      "destination": "/api/create-upload-url"
+    },
+    {
       "source": "/api/extract-document",
       "destination": "/api/extract-document"
     },

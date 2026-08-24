@@ -4,6 +4,8 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import { processDocumentExtraction } from "./src/services/extractionEngine";
+import { supabaseAdmin, BUCKET_NAME } from "./src/supabase";
+
 
 
 
@@ -228,17 +230,116 @@ export async function createExpressApp() {
   });
 
   // ==========================================
-  // DOCUMENT EXTRACTION & UPLOAD ROUTES
+  // DOCUMENT EXTRACTION & SUPABASE UPLOAD ROUTES
   // ==========================================
 
-  // Document extraction API using unified processDocumentExtraction engine
+  // POST /api/create-upload-url - Generate Supabase signed upload URL
+  app.post("/api/create-upload-url", async (req, res) => {
+    try {
+      const { fileName, mimeType, fileSize } = req.body || {};
+
+      if (!fileName || !mimeType) {
+        return res.status(400).json({
+          success: false,
+          error: 'INVALID_FILE_TYPE',
+          message: 'File name and MIME type are required.',
+        });
+      }
+
+      const cleanMime = String(mimeType).toLowerCase();
+      const cleanFileName = String(fileName).toLowerCase();
+      const validMimes = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg', 'image/webp'];
+      const validExts = ['.pdf', '.jpg', '.jpeg', '.png', '.webp'];
+
+      const ext = '.' + cleanFileName.split('.').pop();
+      if (!validMimes.includes(cleanMime) && !validExts.includes(ext)) {
+        return res.status(400).json({
+          success: false,
+          error: 'INVALID_FILE_TYPE',
+          message: 'Unsupported file format. Please upload a PDF, JPG, PNG, or WEBP document.',
+        });
+      }
+
+      if (fileSize && fileSize > 20 * 1024 * 1024) {
+        return res.status(400).json({
+          success: false,
+          error: 'FILE_TOO_LARGE',
+          message: 'The uploaded file is larger than the 20MB supported limit.',
+        });
+      }
+
+      const fileId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+      const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const storagePath = `anonymous/${fileId}-${sanitizedName}`;
+
+      try {
+        await supabaseAdmin.storage.createBucket(BUCKET_NAME, {
+          public: false,
+          fileSizeLimit: 20971520,
+          allowedMimeTypes: validMimes,
+        });
+      } catch (_) {}
+
+      const { data, error } = await supabaseAdmin.storage
+        .from(BUCKET_NAME)
+        .createSignedUploadUrl(storagePath);
+
+      if (error || !data) {
+        return res.json({
+          success: true,
+          bucket: BUCKET_NAME,
+          path: storagePath,
+          signedUrl: null,
+          token: null,
+        });
+      }
+
+      return res.json({
+        success: true,
+        bucket: BUCKET_NAME,
+        path: storagePath,
+        signedUrl: data.signedUrl,
+        token: data.token,
+      });
+    } catch (error: any) {
+      console.error('[CREATE_UPLOAD_URL_ERROR]', error);
+      return res.status(500).json({
+        success: false,
+        error: 'STORAGE_ERROR',
+        message: error.message || 'Failed to create upload authorization.',
+      });
+    }
+  });
+
+  // Document extraction API using Supabase Storage download & extraction engine
   app.post("/api/extract-document", async (req, res) => {
     try {
-      const { fileBase64, storageUrl, mimeType, fileName, fileSize } = req.body || {};
+      const { bucket, path, storageUrl, fileBase64, mimeType, fileName, fileSize } = req.body || {};
 
       let fileBuffer: Buffer | undefined;
 
-      if (storageUrl && String(storageUrl).startsWith('http')) {
+      // 1. Download document from Supabase Storage using bucket and path
+      if (path) {
+        const targetBucket = bucket || BUCKET_NAME;
+        try {
+          const { data: blobData, error: downloadErr } = await supabaseAdmin.storage
+            .from(targetBucket)
+            .download(path);
+
+          if (blobData && !downloadErr) {
+            const arrayBuffer = await blobData.arrayBuffer();
+            fileBuffer = Buffer.from(arrayBuffer);
+            console.log(`[SERVER_EXTRACT] Successfully downloaded ${fileBuffer.length} bytes from Supabase Storage (${targetBucket}/${path})`);
+          } else if (downloadErr) {
+            console.warn(`[SERVER_EXTRACT] Supabase download error for path ${path}:`, downloadErr.message);
+          }
+        } catch (subErr) {
+          console.warn(`[SERVER_EXTRACT] Exception downloading from Supabase Storage:`, subErr);
+        }
+      }
+
+      // 2. Secondary fallback: storageUrl download
+      if (!fileBuffer && storageUrl && String(storageUrl).startsWith('http')) {
         try {
           const fetchRes = await fetch(storageUrl);
           if (fetchRes.ok) {
@@ -253,18 +354,26 @@ export async function createExpressApp() {
       if (!fileBase64 && !fileBuffer) {
         return res.status(400).json({
           success: false,
-          error: 'INVALID_FILE_TYPE',
-          message: 'Missing file data, base64 payload, or storage URL.',
+          error: 'DOWNLOAD_FAILED',
+          message: 'Could not retrieve document from Supabase Storage. Please try uploading again or enter details manually.',
         });
       }
 
       const result = await processDocumentExtraction({
         fileBase64,
         fileBuffer,
-        mimeType,
+        mimeType: mimeType || 'application/pdf',
         fileName,
         fileSize,
       });
+
+      if (path && result.success) {
+        supabaseAdmin.storage
+          .from(bucket || BUCKET_NAME)
+          .remove([path])
+          .then(() => console.log(`[SERVER_EXTRACT] Cleaned up temporary storage path: ${path}`))
+          .catch(() => {});
+      }
 
       if (!result.success) {
         const isBadRequest = result.error === 'FILE_TOO_LARGE' || result.error === 'INVALID_FILE_TYPE';

@@ -82,7 +82,7 @@ export const DocumentUploadCard: React.FC<DocumentUploadCardProps> = ({
     setUploadStatus('idle');
     setIsProcessing(true);
     setIsVaultSaved(false);
-    setCurrentStage('Reading file...');
+    setCurrentStage('Validating file...');
 
     try {
       // Step 1: AI Metadata Extraction via Gemini + Fast pdf-parse
